@@ -8,37 +8,18 @@ module.exports = async (req, res) => {
     return res.status(400).json({ status: 'error', message: 'Query is required' });
   }
 
-  const gogoURL = `https://gogoanime.pe//search.html?keyword=${encodeURIComponent(query)}`;
   const animepaheURL = `https://animepahe.ru/api?m=search&q=${encodeURIComponent(query)}`;
+  const animeheavenURL = `https://animeheaven.me/search.php?title=${encodeURIComponent(query)}`;
 
   let results = [];
 
   try {
-    // GogoAnime Scraper
-    const gogoRes = await axios.get(gogoURL);
-    const $ = cheerio.load(gogoRes.data);
-
-    $('.last_episodes > ul > li').each((i, el) => {
-      const title = $(el).find('p.name a').text().trim();
-      const url = 'https://gogoanime.pe' + $(el).find('p.name a').attr('href');
-      const image = $(el).find('.img a img').attr('src');
-
-      results.push({
-        title,
-        image,
-        sources: [
-          {
-            site: "GogoAnime",
-            url
-          }
-        ]
-      });
-    });
-
-    // AnimePahe Scraper
+    // AnimePahe
     const paheRes = await axios.get(animepaheURL);
-    if (paheRes.data.data && paheRes.data.data.length > 0) {
-      paheRes.data.data.forEach(anime => {
+    const paheData = paheRes.data.data || [];
+
+    if (paheData.length > 0) {
+      paheData.forEach(anime => {
         results.push({
           title: anime.title,
           image: anime.poster,
@@ -49,6 +30,35 @@ module.exports = async (req, res) => {
             }
           ]
         });
+      });
+    }
+
+    // AnimeHeaven
+    const heavenRes = await axios.get(animeheavenURL);
+    const $ = cheerio.load(heavenRes.data);
+
+    $('.series').each((i, el) => {
+      const title = $(el).find('a').text().trim();
+      const url = 'https://animeheaven.me/' + $(el).find('a').attr('href');
+      const image = $(el).find('img').attr('src');
+
+      results.push({
+        title,
+        image,
+        sources: [
+          {
+            site: "AnimeHeaven",
+            url
+          }
+        ]
+      });
+    });
+
+    if (results.length === 0) {
+      return res.status(404).json({
+        status: "not_found",
+        query,
+        message: "No anime found"
       });
     }
 
