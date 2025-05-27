@@ -3,87 +3,106 @@ import * as cheerio from "cheerio";
 
 export default async function handler(req, res) {
   const { query } = req.query;
+  if (!query) return res.status(400).json({ status: "error", message: "Use ?query=anime name" });
 
-  if (!query) {
-    return res.status(400).json({ status: "error", message: "query is required, example: ?query=naruto /episode 2" });
-  }
+  const raw = query.trim();
+  const match = raw.match(/(.+)\/episode\s*(\d+)/i);
+  const animeTitle = match ? match[1].trim() : raw;
+  const episodeNumber = match ? parseInt(match[2]) : null;
 
-  const [animeQuery, epPart] = query.split("/episode");
-  const animeName = animeQuery?.trim();
-  const episodeNum = epPart?.trim();
-
-  if (!animeName || !episodeNum) {
-    return res.status(400).json({ status: "error", message: "Query must be like: naruto /episode 2" });
-  }
-
-  try {
-    // 1. Search Anime
-    const searchUrl = `https://animeheaven.me/search.php?title=${encodeURIComponent(animeName)}`;
-    const searchRes = await axios.get(searchUrl, {
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-
-    const $ = cheerio.load(searchRes.data);
-    const animePath = $(".series").first().find("a").attr("href");
-    const animeTitle = $(".series").first().find("a").text().trim();
-    if (!animePath) return res.status(404).json({ status: "error", message: "Anime not found" });
-
-    const animeUrl = `https://animeheaven.me/${animePath}`;
-
-    // 2. Get episodes
-    const animePage = await axios.get(animeUrl, {
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-
-    const $$ = cheerio.load(animePage.data);
-    const episodes = [];
-
-    $$(".episode").each((_, el) => {
-      const epText = $$(el).text().trim();
-      const epHref = $$(el).attr("href");
-      episodes.push({
-        title: epText,
-        url: `https://animeheaven.me/${epHref}`,
-      });
-    });
-
-    const episode = episodes.find((ep) => ep.title.includes(`Episode ${episodeNum}`));
-    if (!episode) return res.status(404).json({ status: "error", message: "Episode not found" });
-
-    // 3. Get episode page
-    const epPage = await axios.get(episode.url, {
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-    const $$$ = cheerio.load(epPage.data);
-    const iframeSrc = $$$("iframe").attr("src");
-
-    let videoLink = null;
-    let thumbnail = null;
-
-    if (iframeSrc) {
-      const videoFrame = await axios.get(iframeSrc, {
-        headers: { "User-Agent": "Mozilla/5.0", Referer: episode.url },
-      });
-
-      const fileMatch = videoFrame.data.match(/file:\s*"(https?:\/\/[^"]+\.(mp4|mkv))"/);
-      const thumbMatch = videoFrame.data.match(/image:\s*"(https?:\/\/[^"]+\.(jpg|png))"/);
-
-      if (fileMatch) videoLink = fileMatch[1];
-      if (thumbMatch) thumbnail = thumbMatch[1];
+  const sources = [fetchFromAnimeHeaven, fetchFromKissAnime, fetchFromAnitaku];
+  for (const source of sources) {
+    try {
+      const result = await source(animeTitle, episodeNumber);
+      if (result) return res.json(result);
+    } catch (err) {
+      console.warn(`${source.name} failed:`, err.message);
     }
-
-    res.json({
-      status: "success",
-      title: animeTitle,
-      animeUrl,
-      episode: {
-        ...episode,
-        video: videoLink,
-        thumbnail,
-      },
-      source: "animeheaven.me",
-    });
-  } catch (err) {
-    return res.status(500).json({ status: "error", message: "Server error", error: err.message });
   }
+
+  return res.status(404).json({ status: "error", message: "Anime not found" });
+}
+
+function formatResult(source, title, episodes, epNum) {
+  if (epNum) {
+    const found = episodes.find(e => e.title.toLowerCase().includes(`episode ${epNum}`));
+    if (!found) throw new Error("Episode not found");
+    return { status: "success", source, title, episode: found };
+  } else {
+    return { status: "success", source, title, episodes };
+  }
+}
+
+async function fetchFromAnimeHeaven(name, epNum) {
+  const searchUrl = `https://animeheaven.me/search.php?title=${encodeURIComponent(name)}`;
+  const res = await axios.get(searchUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+  const $ = cheerio.load(res.data);
+  const link = $(".series a").attr("href");
+  if (!link) throw new Error("Not found");
+
+  const page = await axios.get(`https://animeheaven.me/${link}`, { headers: { "User-Agent": "Mozilla/5.0" } });
+  const $$ = cheerio.load(page.data);
+  const thumbnail = $$("div.cover img").attr("src");
+  const episodes = $$("a.episode").toArray().map(el => {
+    const href = $$(el).attr("href");
+    return {
+      title: $$(el).text().trim(),
+      url: `https://animeheaven.me/${href}`,
+      download: `https://animeheaven.me/${href}`, // usually same
+      quality: "720p"
+    };
+  });
+
+  return formatResult("animeheaven.me", name, episodes.map(e => ({ ...e, thumbnail })), epNum);
+}
+
+async function fetchFromKissAnime(name, epNum) {
+  const searchUrl = `https://kissanime.com.ru/Search/Anime?q=${encodeURIComponent(name)}`;
+  const res = await axios.get(searchUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+  const $ = cheerio.load(res.data);
+  const animeUrl = $("a[href*='/Anime/']").first().attr("href");
+  if (!animeUrl) throw new Error("Not found");
+
+  const page = await axios.get(`https://kissanime.com.ru${animeUrl}`, {
+    headers: { "User-Agent": "Mozilla/5.0" }
+  });
+  const $$ = cheerio.load(page.data);
+  const thumbnail = $$("div.anime_info_body_bg img").attr("src");
+  const episodes = $$("a")
+    .toArray()
+    .filter(el => $$(el).attr("href")?.includes("/Episode/"))
+    .map(el => {
+      const href = $$(el).attr("href");
+      return {
+        title: $$(el).text().trim(),
+        url: `https://kissanime.com.ru${href}`,
+        download: `https://kissanime.com.ru${href}`,
+        quality: "480p"
+      };
+    });
+
+  return formatResult("kissanime.com.ru", name, episodes.map(e => ({ ...e, thumbnail })), epNum);
+}
+
+async function fetchFromAnitaku(name, epNum) {
+  const searchUrl = `https://anitaku.to/search.html?keyword=${encodeURIComponent(name)}`;
+  const res = await axios.get(searchUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+  const $ = cheerio.load(res.data);
+  const animeUrl = $(".name a").first().attr("href");
+  if (!animeUrl) throw new Error("Not found");
+
+  const page = await axios.get(animeUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+  const $$ = cheerio.load(page.data);
+  const thumbnail = $$("div.anime_info_body_bg img").attr("src");
+  const episodes = $$("ul#episode_related li a").toArray().map(el => {
+    const href = $$(el).attr("href");
+    return {
+      title: $$(el).text().trim(),
+      url: "https://anitaku.to" + href,
+      download: "https://anitaku.to" + href,
+      quality: "1080p"
+    };
+  });
+
+  return formatResult("anitaku.to", name, episodes.map(e => ({ ...e, thumbnail })), epNum);
 }
