@@ -1,108 +1,63 @@
-import axios from "axios";
-import * as cheerio from "cheerio";
+import axios from 'axios';
+import cheerio from 'cheerio';
 
 export default async function handler(req, res) {
   const { query } = req.query;
-  if (!query) return res.status(400).json({ status: "error", message: "Use ?query=anime name" });
+  if (!query) return res.status(400).json({ status: 'error', message: 'Query required' });
 
-  const raw = query.trim();
-  const match = raw.match(/(.+)\/episode\s*(\d+)/i);
-  const animeTitle = match ? match[1].trim() : raw;
-  const episodeNumber = match ? parseInt(match[2]) : null;
+  const lower = query.toLowerCase();
+  let animeName = query;
+  let episodeNumber = null;
 
-  const sources = [fetchFromAnimeHeaven, fetchFromKissAnime, fetchFromAnitaku];
-  for (const source of sources) {
-    try {
-      const result = await source(animeTitle, episodeNumber);
-      if (result) return res.json(result);
-    } catch (err) {
-      console.warn(`${source.name} failed:`, err.message);
-    }
+  // Handle "naruto season 1 /episode 2"
+  if (lower.includes('/episode')) {
+    const [name, ep] = lower.split('/episode');
+    animeName = name.trim();
+    episodeNumber = ep.trim();
   }
 
-  return res.status(404).json({ status: "error", message: "Anime not found" });
-}
+  try {
+    // 1. Scrape from Anitaku
+    const searchUrl = `https://anitaku.to/search.html?keyword=${encodeURIComponent(animeName)}`;
+    const searchHtml = await axios.get(searchUrl).then(r => r.data);
+    const $ = cheerio.load(searchHtml);
 
-function formatResult(source, title, episodes, epNum) {
-  if (epNum) {
-    const found = episodes.find(e => e.title.toLowerCase().includes(`episode ${epNum}`));
-    if (!found) throw new Error("Episode not found");
-    return { status: "success", source, title, episode: found };
-  } else {
-    return { status: "success", source, title, episodes };
-  }
-}
-
-async function fetchFromAnimeHeaven(name, epNum) {
-  const searchUrl = `https://animeheaven.me/search.php?title=${encodeURIComponent(name)}`;
-  const res = await axios.get(searchUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
-  const $ = cheerio.load(res.data);
-  const link = $(".series a").attr("href");
-  if (!link) throw new Error("Not found");
-
-  const page = await axios.get(`https://animeheaven.me/${link}`, { headers: { "User-Agent": "Mozilla/5.0" } });
-  const $$ = cheerio.load(page.data);
-  const thumbnail = $$("div.cover img").attr("src");
-  const episodes = $$("a.episode").toArray().map(el => {
-    const href = $$(el).attr("href");
-    return {
-      title: $$(el).text().trim(),
-      url: `https://animeheaven.me/${href}`,
-      download: `https://animeheaven.me/${href}`, // usually same
-      quality: "720p"
-    };
-  });
-
-  return formatResult("animeheaven.me", name, episodes.map(e => ({ ...e, thumbnail })), epNum);
-}
-
-async function fetchFromKissAnime(name, epNum) {
-  const searchUrl = `https://kissanime.com.ru/Search/Anime?q=${encodeURIComponent(name)}`;
-  const res = await axios.get(searchUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
-  const $ = cheerio.load(res.data);
-  const animeUrl = $("a[href*='/Anime/']").first().attr("href");
-  if (!animeUrl) throw new Error("Not found");
-
-  const page = await axios.get(`https://kissanime.com.ru${animeUrl}`, {
-    headers: { "User-Agent": "Mozilla/5.0" }
-  });
-  const $$ = cheerio.load(page.data);
-  const thumbnail = $$("div.anime_info_body_bg img").attr("src");
-  const episodes = $$("a")
-    .toArray()
-    .filter(el => $$(el).attr("href")?.includes("/Episode/"))
-    .map(el => {
-      const href = $$(el).attr("href");
-      return {
-        title: $$(el).text().trim(),
-        url: `https://kissanime.com.ru${href}`,
-        download: `https://kissanime.com.ru${href}`,
-        quality: "480p"
-      };
+    const links = [];
+    $('div.last_episodes ul.items li').each((i, el) => {
+      const title = $(el).find('p.name a').text().trim();
+      const url = 'https://anitaku.to' + $(el).find('p.name a').attr('href');
+      links.push({ title, url });
     });
 
-  return formatResult("kissanime.com.ru", name, episodes.map(e => ({ ...e, thumbnail })), epNum);
-}
+    if (links.length === 0) throw new Error('Anime not found');
 
-async function fetchFromAnitaku(name, epNum) {
-  const searchUrl = `https://anitaku.to/search.html?keyword=${encodeURIComponent(name)}`;
-  const res = await axios.get(searchUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
-  const $ = cheerio.load(res.data);
-  const animeUrl = $(".name a").first().attr("href");
-  if (!animeUrl) throw new Error("Not found");
+    // 2. Get episode list from first match
+    const animePage = await axios.get(links[0].url).then(r => r.data);
+    const $$ = cheerio.load(animePage);
 
-  const page = await axios.get(animeUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
-  const $$ = cheerio.load(page.data);
-  const thumbnail = $$("div.anime_info_body_bg img").attr("src");
-  const episodes = $$("ul#episode_related li a").toArray().map(el => {
-    const href = $$(el).attr("href");
-    return {
-      title: $$(el).text().trim(),
-      url: "https://anitaku.to" + href,
-      download: "https://anitaku.to" + href,
-      quality: "1080p"
-    };
-  });
+    const episodes = [];
+    $$('#episode_page li a').each((i, el) => {
+      const epNum = $$(el).attr('ep_start');
+      if (epNum) {
+        const epUrl = links[0].url.replace('category/', ''); // base path
+        episodes.push({
+          title: `${links[0].title} - Episode ${epNum}`,
+          download: `https://anitaku.to${epUrl}-episode-${epNum}`,
+          stream: `https://anitaku.to${epUrl}-episode-${epNum}`,
+          quality: 'HD',
+          thumbnail: 'https://img.anitaku.to/cover.jpg'
+        });
+      }
+    });
 
-  return formatResult("anitaku.to", name, episodes.map(e => ({ ...e, thumbnail })), epNum);
+    if (episodeNumber) {
+      const ep = episodes.find(e => e.title.includes(`Episode ${episodeNumber}`));
+      if (!ep) return res.status(404).json({ status: 'error', message: 'Episode not found' });
+      return res.json({ status: 'success', source: 'anitaku', episode: ep });
+    }
+
+    res.json({ status: 'success', source: 'anitaku', episodes });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
 }
