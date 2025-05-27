@@ -1,20 +1,36 @@
-const axios = require("axios");
-const cheerio = require("cheerio");
+import axios from "axios";
+import * as cheerio from "cheerio";
 
-async function getAnimeHeavenEpisode(animeName, episodeNum) {
+export default async function handler(req, res) {
+  const { query } = req.query;
+
+  if (!query) {
+    return res.status(400).json({ status: "error", message: "query is required, example: ?query=naruto /episode 2" });
+  }
+
+  const [animeQuery, epPart] = query.split("/episode");
+  const animeName = animeQuery?.trim();
+  const episodeNum = epPart?.trim();
+
+  if (!animeName || !episodeNum) {
+    return res.status(400).json({ status: "error", message: "Query must be like: naruto /episode 2" });
+  }
+
   try {
+    // 1. Search Anime
     const searchUrl = `https://animeheaven.me/search.php?title=${encodeURIComponent(animeName)}`;
-    const response = await axios.get(searchUrl, {
+    const searchRes = await axios.get(searchUrl, {
       headers: { "User-Agent": "Mozilla/5.0" },
     });
 
-    const $ = cheerio.load(response.data);
-    const firstResult = $(".series").first();
-    if (!firstResult.length) return null;
+    const $ = cheerio.load(searchRes.data);
+    const animePath = $(".series").first().find("a").attr("href");
+    const animeTitle = $(".series").first().find("a").text().trim();
+    if (!animePath) return res.status(404).json({ status: "error", message: "Anime not found" });
 
-    const title = firstResult.find("a").text().trim();
-    const animeUrl = "https://animeheaven.me/" + firstResult.find("a").attr("href");
+    const animeUrl = `https://animeheaven.me/${animePath}`;
 
+    // 2. Get episodes
     const animePage = await axios.get(animeUrl, {
       headers: { "User-Agent": "Mozilla/5.0" },
     });
@@ -23,77 +39,51 @@ async function getAnimeHeavenEpisode(animeName, episodeNum) {
     const episodes = [];
 
     $$(".episode").each((_, el) => {
-      const epTitle = $$(el).text().trim();
-      const epUrl = "https://animeheaven.me/" + $$(el).attr("href");
-      episodes.push({ title: epTitle, url: epUrl });
+      const epText = $$(el).text().trim();
+      const epHref = $$(el).attr("href");
+      episodes.push({
+        title: epText,
+        url: `https://animeheaven.me/${epHref}`,
+      });
     });
 
     const episode = episodes.find((ep) => ep.title.includes(`Episode ${episodeNum}`));
-    if (!episode) return null;
+    if (!episode) return res.status(404).json({ status: "error", message: "Episode not found" });
 
-    const videoPage = await axios.get(episode.url, {
+    // 3. Get episode page
+    const epPage = await axios.get(episode.url, {
       headers: { "User-Agent": "Mozilla/5.0" },
     });
-    const $$$ = cheerio.load(videoPage.data);
-    const iframe = $$$("iframe").attr("src");
-    if (!iframe) return { ...episode, video: null };
+    const $$$ = cheerio.load(epPage.data);
+    const iframeSrc = $$$("iframe").attr("src");
 
-    const finalRes = await axios.get(iframe, {
-      headers: { Referer: episode.url, "User-Agent": "Mozilla/5.0" },
-    });
+    let videoLink = null;
+    let thumbnail = null;
 
-    const match = finalRes.data.match(/file:\s*"(https?:\/\/[^"]+\.(mp4|mkv))"/);
-    const thumbMatch = finalRes.data.match(/image:\s*"(https?:\/\/[^"]+\.(jpg|png))"/);
+    if (iframeSrc) {
+      const videoFrame = await axios.get(iframeSrc, {
+        headers: { "User-Agent": "Mozilla/5.0", Referer: episode.url },
+      });
 
-    return {
-      title,
+      const fileMatch = videoFrame.data.match(/file:\s*"(https?:\/\/[^"]+\.(mp4|mkv))"/);
+      const thumbMatch = videoFrame.data.match(/image:\s*"(https?:\/\/[^"]+\.(jpg|png))"/);
+
+      if (fileMatch) videoLink = fileMatch[1];
+      if (thumbMatch) thumbnail = thumbMatch[1];
+    }
+
+    res.json({
+      status: "success",
+      title: animeTitle,
       animeUrl,
       episode: {
-        title: episode.title,
-        url: episode.url,
-        video: match ? match[1] : null,
-        thumbnail: thumbMatch ? thumbMatch[1] : null,
+        ...episode,
+        video: videoLink,
+        thumbnail,
       },
-      source: "animeheaven",
-    };
-  } catch {
-    return null;
+      source: "animeheaven.me",
+    });
+  } catch (err) {
+    return res.status(500).json({ status: "error", message: "Server error", error: err.message });
   }
 }
-
-async function getZoroFallback(animeName, episodeNum) {
-  // Dummy fallback example
-  return {
-    title: animeName,
-    animeUrl: `https://zoro.to/search?keyword=${encodeURIComponent(animeName)}`,
-    episode: {
-      title: `Episode ${episodeNum}`,
-      url: `https://zoro.to/${animeName.replace(/\s+/g, "-").toLowerCase()}-episode-${episodeNum}`,
-      video: null,
-      thumbnail: null,
-    },
-    source: "zoro (fallback)",
-  };
-}
-
-module.exports = async (req, res) => {
-  const { query } = req.query;
-  if (!query) return res.status(400).json({ status: "error", message: "Query is required" });
-
-  const [animeQuery, episodeQueryRaw] = query.split("/episode");
-  const animeName = animeQuery.trim();
-  const episodeNum = episodeQueryRaw ? parseInt(episodeQueryRaw.trim()) : null;
-
-  if (!episodeNum) {
-    return res.status(400).json({ status: "error", message: "Please provide like: naruto season 1 /episode 2" });
-  }
-
-  const result = await getAnimeHeavenEpisode(animeName, episodeNum) || await getZoroFallback(animeName, episodeNum);
-
-  if (!result) return res.status(404).json({ status: "error", message: "Episode not found" });
-
-  return res.json({
-    status: "success",
-    ...result,
-  });
-};
